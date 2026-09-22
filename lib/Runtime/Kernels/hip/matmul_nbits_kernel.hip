@@ -60,6 +60,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1141,48 +1142,68 @@ static void launchGemvConfig(
 template <typename LaunchFn>
 static void settleClock(hipEvent_t ev0, hipEvent_t ev1, hipStream_t stream,
                         LaunchFn&& launch) {
+    constexpr int kBatch = 64;
     float prev = 1e30f, cur = 0.0f, total = 0.0f;
     int stable = 0;
     for (int i = 0; i < 200 && stable < 3 && total < 200.0f; i++) {
         hipEventRecord(ev0, stream);
-        launch();
+        for (int j = 0; j < kBatch; ++j)
+            launch();
         hipEventRecord(ev1, stream);
         hipEventSynchronize(ev1);
-        hipEventElapsedTime(&cur, ev0, ev1);
+        float batch_ms = 0.0f;
+        hipEventElapsedTime(&batch_ms, ev0, ev1);
+        cur = batch_ms / kBatch;
         if (total >= 60.0f && cur <= prev * 1.02f) stable++;
         else                                       stable = 0;
         prev = cur;
-        total += cur;
+        total += batch_ms;
     }
 }
 
-// Time one config: `warmup` untimed launches, then the min (peak) of `iters`
-// timed launches -- a config is judged by its least-throttled sample, not an
-// average that folds in throttled ones. Sub-`floor_ms` configs get extra
-// iterations up to `floor_iters`: hipEventElapsedTime's own timer noise is
-// comparable to the signal at that scale, so a small-iters min alone is not
-// trustworthy there. A reading <= 0 is not a real duration (Windows HIP event
-// timer noise at sub-0.1ms scale can yield this); it must never win the min.
+// Time one config with batches large enough to reach roughly 1 ms, then return
+// the median per-launch latency. Repeating single-launch events cannot improve
+// the Windows HIP timer's sub-0.1 ms resolution; taking their minimum produced
+// unstable winners and even 0.0000 ms readings for Gemma4 decode shapes. The
+// median also rejects one-off boost/interrupt samples for large kernels.
 template <typename LaunchFn>
 static float timeConfigPeak(hipEvent_t ev0, hipEvent_t ev1, hipStream_t stream,
                             int warmup, int iters, int floor_iters, float floor_ms,
                             LaunchFn&& launch) {
     for (int w = 0; w < warmup; w++) launch();
 
-    float best = 1e30f;
-    int iter_count = 0;
-    while (iter_count < iters ||
-           (best < floor_ms && iter_count < floor_iters)) {
+    hipEventRecord(ev0, stream);
+    launch();
+    hipEventRecord(ev1, stream);
+    hipEventSynchronize(ev1);
+    float pilot_ms = 0.0f;
+    hipEventElapsedTime(&pilot_ms, ev0, ev1);
+    const float estimate = fmaxf(pilot_ms, 0.001f);
+    const int batch = std::min(
+        256, std::max(1, static_cast<int>(ceilf(1.0f / estimate))));
+
+    constexpr int kMaxSamples = 64;
+    const int sample_count = std::min(
+        kMaxSamples, std::max(iters, floor_iters));
+    float samples[kMaxSamples];
+    int valid = 0;
+    for (int i = 0; i < sample_count; ++i) {
         hipEventRecord(ev0, stream);
-        launch();
+        for (int j = 0; j < batch; ++j)
+            launch();
         hipEventRecord(ev1, stream);
         hipEventSynchronize(ev1);
         float ms = 0.0f;
         hipEventElapsedTime(&ms, ev0, ev1);
-        if (ms > 0.0f && ms < best) best = ms;
-        iter_count++;
+        const float per_launch_ms = ms / batch;
+        if (per_launch_ms > 0.0f)
+            samples[valid++] = per_launch_ms;
     }
-    return best;
+    if (valid == 0)
+        return 1e30f;
+    std::sort(samples, samples + valid);
+    (void)floor_ms;
+    return samples[valid / 2];
 }
 
 static int tuneGemvConfig(
@@ -1521,7 +1542,13 @@ static int tuneDp4aConfig(
             cid, kGemvConfigs[cid].threads, kGemvConfigs[cid].tile_n,
             cfg_best_ms);
 
-        if (cfg_best_ms < best_ms) { best_ms = cfg_best_ms; best_id = cid; }
+        // Treat sub-2% differences as a tie and keep the earlier config.
+        // Short Gemma4 GEMVs have several geometries within timer/clock noise;
+        // strict-min selection made the shipped winner vary between runs.
+        if (cfg_best_ms < best_ms * 0.98f) {
+            best_ms = cfg_best_ms;
+            best_id = cid;
+        }
     }
     hipEventDestroy(ev0);
     hipEventDestroy(ev1);
