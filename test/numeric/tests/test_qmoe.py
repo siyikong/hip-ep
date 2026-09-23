@@ -40,6 +40,11 @@ TOP_K = 4
 BLOCK_SIZE = 32
 EXPERT_WEIGHT_BITS = 4
 
+GEMMA4_HIDDEN = 2816
+GEMMA4_INTERMEDIATE = 1408
+GEMMA4_NUM_EXPERTS = 128
+GEMMA4_TOP_K = 8
+
 
 def _make_qmoe_model(
     batch: int,
@@ -54,6 +59,7 @@ def _make_qmoe_model(
     down_scale_range: tuple[float, float] = (0.001, 0.02),
     down_bias_range: tuple[float, float] = (-0.5, 0.5),
     seed: int = 42,
+    include_bias: bool = True,
 ):
     """Build a QMoE ONNX model with random quantized expert weights.
 
@@ -125,11 +131,14 @@ def _make_qmoe_model(
     initializers = [
         numpy_helper.from_array(gate_up_qw, name="gate_up_qweight"),
         numpy_helper.from_array(gate_up_scales, name="gate_up_scales"),
-        numpy_helper.from_array(gate_up_bias, name="gate_up_bias"),
         numpy_helper.from_array(down_qw, name="down_qweight"),
         numpy_helper.from_array(down_scales, name="down_scales"),
-        numpy_helper.from_array(down_bias, name="down_bias"),
     ]
+    if include_bias:
+        initializers.extend([
+            numpy_helper.from_array(gate_up_bias, name="gate_up_bias"),
+            numpy_helper.from_array(down_bias, name="down_bias"),
+        ])
 
     node = helper.make_node(
         "QMoE",
@@ -138,10 +147,10 @@ def _make_qmoe_model(
             "router_weights",
             "gate_up_qweight",
             "gate_up_scales",
-            "gate_up_bias",
+            "gate_up_bias" if include_bias else "",
             "down_qweight",
             "down_scales",
-            "down_bias",
+            "down_bias" if include_bias else "",
             "",
             "",
             "",
@@ -204,6 +213,53 @@ class TestQMoE:
 
         actual, expected = model_runner.run_sample(model, [x, router])
         compare_outputs(actual, expected, atol=5e-2, rtol=1e-2, cos_threshold=0.999)
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("seq_len", [1, 274])
+    def test_qmoe_gemma4_26b_shape(self, model_runner, seq_len):
+        """Exact Gemma4-26B QMoE geometry for decode and VLM prefill."""
+        model = _make_qmoe_model(
+            1,
+            seq_len,
+            GEMMA4_HIDDEN,
+            GEMMA4_INTERMEDIATE,
+            GEMMA4_NUM_EXPERTS,
+            GEMMA4_TOP_K,
+            BLOCK_SIZE,
+            gate_up_scale_range=(0.001, 0.03),
+            down_scale_range=(0.001, 0.03),
+            include_bias=False,
+        )
+
+        rng = np.random.default_rng(99)
+        x = rng.uniform(
+            -1,
+            1,
+            [1, seq_len, GEMMA4_HIDDEN],
+        ).astype(np.float16)
+        # Keep the top-8 routing decision far from an fp16 tie so the test
+        # compares QMoE arithmetic rather than CPU/GPU top-k tie-breaking.
+        router = np.full(
+            [seq_len, GEMMA4_NUM_EXPERTS],
+            -8.0,
+            dtype=np.float16,
+        )
+        for token in range(seq_len):
+            for slot in range(GEMMA4_TOP_K):
+                expert = (
+                    token * GEMMA4_TOP_K + slot
+                ) % GEMMA4_NUM_EXPERTS
+                router[token, expert] = np.float16(8.0 - 0.5 * slot)
+
+        actual, expected = model_runner.run_sample(model, [x, router])
+        assert np.isfinite(actual[0]).all()
+        compare_outputs(
+            actual,
+            expected,
+            atol=1.5e-1,
+            rtol=1e-2,
+            cos_threshold=0.99,
+        )
 
     @pytest.mark.parametrize("seq_len", SEQ_LENS)
     def test_qmoe_gpt_oss_shape(self, model_runner, seq_len):

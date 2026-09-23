@@ -103,6 +103,28 @@ QWEN_35B_INT8_HIDDEN = 2048
 QWEN_9B_INT8_HIDDEN = 4096
 QWEN_9B_INT8_INTERMEDIATE = 12288
 
+# --- Gemma4-26B-A4B FP16/W4 constants ---
+GEMMA4_HIDDEN = 2816
+GEMMA4_BLOCK_SIZE = 32
+GEMMA4_DECODER_SHAPES = [
+    (2816, 128),
+    (2816, 1024),
+    (2816, 2048),
+    (2816, 2112),
+    (2816, 4096),
+    (2816, 8192),
+    (2112, 2816),
+    (4096, 2816),
+    (8192, 2816),
+]
+GEMMA4_VISION_SHAPES = [
+    (768, 1152),
+    (1152, 1152),
+    (1152, 2816),
+    (1152, 4304),
+    (4304, 1152),
+]
+
 
 def _make_matmul_nbits_model(
     batch: int,
@@ -115,6 +137,7 @@ def _make_matmul_nbits_model(
     accuracy_level: int = 4,
     seed: int = 42,
     fp32: bool = False,
+    explicit_zero_points: bool = False,
 ):
     """Build a MatMulNBits ONNX model with random quantized weights.
 
@@ -179,10 +202,46 @@ def _make_matmul_nbits_model(
         numpy_helper.from_array(q_weight, name=weight_name),
         numpy_helper.from_array(scales, name="weight_scales"),
     ]
+    node_inputs = ["X", weight_name, "weight_scales"]
+    if explicit_zero_points:
+        if bits == 4:
+            unpacked = rng.integers(
+                0,
+                16,
+                [N, n_blocks],
+                dtype=np.uint8,
+            )
+            zero_points = np.zeros(
+                [N, (n_blocks + 1) // 2],
+                dtype=np.uint8,
+            )
+            zero_points[:, : n_blocks // 2] = (
+                unpacked[:, 0 : 2 * (n_blocks // 2) : 2]
+                | (
+                    unpacked[:, 1 : 2 * (n_blocks // 2) : 2]
+                    << 4
+                )
+            )
+            if n_blocks % 2:
+                zero_points[:, -1] = unpacked[:, -1]
+        else:
+            zero_points = rng.integers(
+                0,
+                1 << bits,
+                [N, n_blocks],
+                dtype=np.uint8,
+            )
+        initializers.append(
+            numpy_helper.from_array(
+                zero_points,
+                name="weight_zero_points",
+            )
+        )
+        node_inputs.append("weight_zero_points")
 
     node = helper.make_node(
         "MatMulNBits",
-        ["X", weight_name, "weight_scales"],
+        node_inputs,
         ["Y"],
         domain="com.microsoft",
         K=K,
@@ -249,6 +308,122 @@ class TestMatMulNBits:
         actual, expected = model_runner.run_sample(model, [x])
         assert np.isfinite(actual[0]).all(), "GPU EP produced NaN/Inf logits"
         compare_outputs(actual, expected, atol=2e-2, rtol=1e-2, cos_threshold=0.999)
+
+    @pytest.mark.parametrize("K,N", GEMMA4_DECODER_SHAPES)
+    def test_matmul_nbits_gemma4_26b_decoder_shape(
+        self,
+        model_runner,
+        K,
+        N,
+    ):
+        """Gemma4-26B single-token decoder MatMulNBits with explicit ZP."""
+        model = _make_matmul_nbits_model(
+            1,
+            1,
+            K,
+            N,
+            scale_range=(-0.02, 0.02),
+            block_size=GEMMA4_BLOCK_SIZE,
+            explicit_zero_points=True,
+        )
+        rng = np.random.default_rng(99)
+        x = rng.uniform(-1, 1, [1, 1, K]).astype(np.float16)
+
+        actual, expected = model_runner.run_sample(model, [x])
+        assert np.isfinite(actual[0]).all()
+        compare_outputs(
+            actual,
+            expected,
+            atol=1e-1,
+            rtol=1e-2,
+            cos_threshold=0.999,
+        )
+
+    @pytest.mark.parametrize("K,N", GEMMA4_VISION_SHAPES)
+    def test_matmul_nbits_gemma4_26b_vision_shape(
+        self,
+        model_runner,
+        K,
+        N,
+    ):
+        """Gemma4 vision-side W4 projections with explicit zero points."""
+        model = _make_matmul_nbits_model(
+            1,
+            1,
+            K,
+            N,
+            scale_range=(-0.02, 0.02),
+            block_size=GEMMA4_BLOCK_SIZE,
+            explicit_zero_points=True,
+        )
+        rng = np.random.default_rng(99)
+        x = rng.uniform(-1, 1, [1, 1, K]).astype(np.float16)
+
+        actual, expected = model_runner.run_sample(model, [x])
+        assert np.isfinite(actual[0]).all()
+        compare_outputs(
+            actual,
+            expected,
+            atol=1e-1,
+            rtol=1e-2,
+            cos_threshold=0.999,
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("K,N", [(2816, 2048), (4096, 2816)])
+    def test_matmul_nbits_gemma4_26b_prefill_shape(
+        self,
+        model_runner,
+        K,
+        N,
+    ):
+        """Gemma4 274-token prefill path for representative projections."""
+        model = _make_matmul_nbits_model(
+            1,
+            274,
+            K,
+            N,
+            scale_range=(-0.02, 0.02),
+            block_size=GEMMA4_BLOCK_SIZE,
+            explicit_zero_points=True,
+        )
+        rng = np.random.default_rng(99)
+        x = rng.uniform(-1, 1, [1, 274, K]).astype(np.float16)
+
+        actual, expected = model_runner.run_sample(model, [x])
+        assert np.isfinite(actual[0]).all()
+        compare_outputs(
+            actual,
+            expected,
+            atol=1e-1,
+            rtol=1e-2,
+            cos_threshold=0.999,
+        )
+
+    @pytest.mark.slow
+    def test_matmul_nbits_gemma4_26b_lm_head_shape(self, model_runner):
+        """Gemma4 last-token vocabulary projection (large-weight test)."""
+        model = _make_matmul_nbits_model(
+            1,
+            1,
+            GEMMA4_HIDDEN,
+            262144,
+            scale_range=(-0.01, 0.01),
+            block_size=GEMMA4_BLOCK_SIZE,
+            explicit_zero_points=True,
+        )
+        rng = np.random.default_rng(99)
+        x = rng.uniform(-1, 1, [1, 1, GEMMA4_HIDDEN]).astype(np.float16)
+
+        actual, expected = model_runner.run_sample(model, [x])
+        assert np.isfinite(actual[0]).all()
+        compare_outputs(
+            actual,
+            expected,
+            atol=1e-1,
+            rtol=1e-2,
+            cos_threshold=0.999,
+        )
 
     @pytest.mark.parametrize("seq_len", SEQ_LENS)
     def test_matmul_nbits_qkv_gpt_oss_shape(self, model_runner, seq_len):

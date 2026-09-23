@@ -79,3 +79,39 @@ add_test(NAME GqaAutotuneUnitTest COMMAND test-gqa-autotune)
 set_tests_properties(GqaAutotuneUnitTest PROPERTIES
     ENVIRONMENT "HIPDNN_EP_GQA_ARCH=gfx1151")
 set_target_properties(test-gqa-autotune PROPERTIES FOLDER "runtime-tests")
+
+# MatMulNBits LUT invariant test. Like the GQA resolver test above, this embeds
+# the shipped gfx1151 FlatBuffer and exercises the production lookup without a
+# GPU. The test source intentionally asserts table invariants rather than
+# hard-coding every winner.
+set(_matmul_test_lut_fb
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/Kernels/hip/autotune/matmul_nbits/lut/gfx1151.fb)
+set(_matmul_test_lut_cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/matmul_nbits_lut_data_test.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${_matmul_test_lut_fb})
+file(READ ${_matmul_test_lut_fb} _matmul_test_hex HEX)
+string(LENGTH "${_matmul_test_hex}" _matmul_test_len)
+math(EXPR _matmul_test_n "${_matmul_test_len} / 2")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1,"
+    _matmul_test_body "${_matmul_test_hex}")
+file(WRITE ${_matmul_test_lut_cpp}
+"// Auto-generated from gfx1151.fb by test/runtime/CMakeLists.txt.\n"
+"#include <cstddef>\n"
+"static const unsigned char _blob[] = {${_matmul_test_body}};\n"
+"extern \"C\" const unsigned char* const kMatmulNbitsLutBlobs[] = { _blob };\n"
+"extern \"C\" const size_t kMatmulNbitsLutBlobSizes[] = { ${_matmul_test_n} };\n"
+"extern \"C\" const size_t kMatmulNbitsLutBlobCount = 1;\n")
+
+add_executable(test-matmul-nbits-lut
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/Kernels/hip/autotune/matmul_nbits/tools/matmul_nbits_lut_test.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/Kernels/hip/autotune/matmul_nbits/matmul_nbits_autotune.cpp
+    ${_matmul_test_lut_cpp}
+)
+target_compile_features(test-matmul-nbits-lut PRIVATE cxx_std_17)
+target_include_directories(test-matmul-nbits-lut PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/Kernels/hip/autotune/matmul_nbits
+)
+target_link_libraries(test-matmul-nbits-lut PRIVATE HipSchemasLib)
+add_test(NAME MatmulNbitsLutUnitTest COMMAND test-matmul-nbits-lut)
+set_target_properties(test-matmul-nbits-lut PROPERTIES FOLDER "runtime-tests")

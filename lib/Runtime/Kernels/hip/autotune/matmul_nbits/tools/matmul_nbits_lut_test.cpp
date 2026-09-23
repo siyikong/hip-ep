@@ -154,6 +154,19 @@ int main() {
   expectExactly("dp4a    Llama-3.1-8B gate/up      N=14336 K=4096",
                 decode(Phase::DecodeDp4a, 14336, 4096, 128, true),
                 Source::Exact);
+  expectExactly("prefill Gemma4-26B Q projection M=256 N=4096 K=2816",
+                prefill(256, 4096, 2816, 32, true), Source::Exact);
+  expectExactly("decode  Gemma4-26B Q projection       N=4096 K=2816",
+                decode(Phase::Decode, 4096, 2816, 32, true), Source::Exact);
+  expectExactly("dp4a    Gemma4-26B Q projection       N=4096 K=2816",
+                decode(Phase::DecodeDp4a, 4096, 2816, 32, true),
+                Source::Exact);
+  expectExactly("dp4a    Gemma4-26B KV projection      N=2048 K=2816",
+                decode(Phase::DecodeDp4a, 2048, 2816, 32, true),
+                Source::Exact);
+  expectExactly("dp4a    Gemma4-26B output projection  N=2816 K=4096",
+                decode(Phase::DecodeDp4a, 2816, 4096, 32, true),
+                Source::Exact);
 
   std::printf("\n-- an exact hit is a zero-distance neighbour --\n");
   {
