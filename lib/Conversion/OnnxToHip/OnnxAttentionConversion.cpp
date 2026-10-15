@@ -351,6 +351,31 @@ OnnxAttentionToHip::matchAndRewrite(mlir::Operation *op,
       mlir::arith::AddIOp::create(rewriter, loc, pastSeqIdx, curSeqIdx)
           .getResult();
 
+  // The mask's KV extent is the logical total sequence. Under OGA shared-KV,
+  // past_key's seq dim is physical capacity (for example 4096), not valid
+  // length; adding current to that extent incorrectly requests capacity+S.
+  // Dynamic-mask models keep the mask at the logical total, so use its last
+  // dimension when available. Models without a mask retain concat semantics.
+  mlir::Value logicalTotalKvIdx = totalKvIdx;
+  if (attnMask) {
+    auto maskType = mlir::dyn_cast<mlir::RankedTensorType>(attnMask.getType());
+    if (!maskType || maskType.getRank() == 0)
+      return rewriter.notifyMatchFailure(
+          op, "attention mask must be ranked with a KV dimension");
+    logicalTotalKvIdx = mlir::tensor::DimOp::create(rewriter, loc, attnMask,
+                                                    maskType.getRank() - 1)
+                            .getResult();
+  }
+
+  // Present storage must fit both the pre-bound physical past buffer and the
+  // logical result. This is past+current for separate buffers, but remains C
+  // when OGA binds the same fixed-capacity OrtValue as past and present.
+  mlir::Value presentSeqIdx = logicalTotalKvIdx;
+  if (pastKey)
+    presentSeqIdx = mlir::arith::MaxSIOp::create(rewriter, loc, pastSeqIdx,
+                                                 logicalTotalKvIdx)
+                        .getResult();
+
   // seqlens_k[b] = total_seq - 1 (ORT GQA convention total_seq = seqlens_k + 1;
   // the runtime derives past_len = total_seq - sq). Ignored by the runtime on
   // the bidirectional no-past path (no_causal && no mask), but computed
@@ -358,7 +383,7 @@ OnnxAttentionToHip::matchAndRewrite(mlir::Operation *op,
   mlir::Value oneIdx =
       mlir::arith::ConstantIndexOp::create(rewriter, loc, 1).getResult();
   mlir::Value totalKvM1Idx =
-      mlir::arith::SubIOp::create(rewriter, loc, totalKvIdx, oneIdx)
+      mlir::arith::SubIOp::create(rewriter, loc, logicalTotalKvIdx, oneIdx)
           .getResult();
   mlir::Value seqlensKI32 =
       mlir::arith::IndexCastOp::create(rewriter, loc, i32Ty, totalKvM1Idx);
@@ -447,8 +472,8 @@ OnnxAttentionToHip::matchAndRewrite(mlir::Operation *op,
         llvm::APInt(32, presentKeyType.getDimSize(2), /*isSigned=*/true));
     totalSeqLen = mlir::arith::ConstantOp::create(rewriter, loc, attr);
   } else {
-    mlir::Value totalKvI32 =
-        mlir::arith::IndexCastOp::create(rewriter, loc, i32Ty, totalKvIdx);
+    mlir::Value totalKvI32 = mlir::arith::IndexCastOp::create(
+        rewriter, loc, i32Ty, logicalTotalKvIdx);
     totalSeqLen = mlir::tensor::FromElementsOp::create(
         rewriter, loc, totalSeqLenType, mlir::ValueRange{totalKvI32});
   }
@@ -463,7 +488,7 @@ OnnxAttentionToHip::matchAndRewrite(mlir::Operation *op,
       if (!t.isDynamicDim(dimIdx))
         continue;
       if (dimIdx == 2)
-        dynSizes.push_back(totalKvIdx);
+        dynSizes.push_back(presentSeqIdx);
       else if (dimIdx == 0)
         dynSizes.push_back(
             mlir::tensor::DimOp::create(rewriter, loc, query, 0).getResult());

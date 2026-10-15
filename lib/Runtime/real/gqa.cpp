@@ -51,6 +51,7 @@
 
 #include "../debug_log.h"
 #include "../hipdnn_ep_runtime.h"
+#include "../kv_cache_manager.h"
 #include "../op_profile.h"
 #include "../op_state.h"
 #include "../runtime_state_internal.h"
@@ -241,17 +242,29 @@ static inline int kv_dtype_abi(KvCacheFormat f) {
 // so that a new call site has to say which it is. The append branches ignore
 // it: they only ever write the new tokens, and an in-place cache has no prefix
 // to copy in the first place.
-static int update_kv_cache(hipStream_t stream, const void *past_key,
-                           const void *past_value, const void *new_key,
-                           const void *new_value, void *present_key,
-                           void *present_value, int B, int past_len, int sq,
-                           int G, int d, int past_buf_seq, int present_seq,
-                           const void *seqlens_k_ptr, int elem_sz, int copy_lo,
-                           bool no_causal = false, int skv = -1,
-                           KvCacheFormat kv_format = KvCacheFormat::Fp16,
-                           const void *k_scale = nullptr,
-                           const void *v_scale = nullptr,
-                           bool kv_bnsd = false) {
+static int record_kv_failure(RuntimeState *state, hipStream_t stream,
+                             KvCacheReason reason, int past_len, int sq,
+                             int capacity) {
+  if (state && state->device_error_flag)
+    (void)hipMemsetAsync(state->device_error_flag, 0xff, sizeof(int), stream);
+  fprintf(stderr,
+          "[KV_CACHE_ERROR] {\"schema\":1,\"decision\":\"reject\","
+          "\"reason\":\"%s\",\"past_len\":%d,\"sq\":%d,"
+          "\"capacity\":%d,\"wrapper_rc\":-1}\n",
+          kv_cache_reason_string(reason), past_len, sq, capacity);
+  return -1;
+}
+
+static int
+update_kv_cache(RuntimeState *state, hipStream_t stream, const void *past_key,
+                const void *past_value, const void *new_key,
+                const void *new_value, void *present_key, void *present_value,
+                int B, int past_len, int sq, int G, int d, int past_buf_seq,
+                int present_seq, const void *seqlens_k_ptr, int elem_sz,
+                int copy_lo, bool no_causal = false, int skv = -1,
+                KvCacheFormat kv_format = KvCacheFormat::Fp16,
+                const void *k_scale = nullptr, const void *v_scale = nullptr,
+                bool kv_bnsd = false) {
   // no_causal: bidirectional attention with no past KV (Whisper encoder /
   // cross-attn, and Gemma-3n-style KV-cache-sharing decoder layers). The KV to
   // attend over is the FULL `new_key`/`new_value` (Skv tokens), not `sq`
@@ -310,26 +323,61 @@ static int update_kv_cache(hipStream_t stream, const void *past_key,
   const bool quantized = (kv_format != KvCacheFormat::Fp16);
   const void *k_sc = quantized ? k_scale : nullptr;
   const void *v_sc = quantized ? v_scale : nullptr;
-  if (past_key && past_len > 0 && past_key != present_key) {
-    // Separate-buffer concat: needs host-side past_len for stride computation.
-    if (hip_gqa_kv_cache_concat(stream, past_key, new_key, present_key, B,
-                                past_len, sq, G, d, past_buf_seq, present_seq,
-                                elem_sz, kv_dtype, k_sc, copy_lo) != 0)
-      return -1;
-    if (hip_gqa_kv_cache_concat(stream, past_value, new_value, present_value, B,
-                                past_len, sq, G, d, past_buf_seq, present_seq,
-                                elem_sz, kv_dtype, v_sc, copy_lo) != 0)
-      return -1;
+  KvCachePlanInput plan_input;
+  plan_input.past_key = past_key;
+  plan_input.past_value = past_value;
+  plan_input.present_key = present_key;
+  plan_input.present_value = present_value;
+  plan_input.past_len = past_len;
+  plan_input.current_len = sq;
+  plan_input.past_buf_seq = past_buf_seq;
+  plan_input.present_seq = present_seq;
+  plan_input.geometry_valid =
+      B > 0 && G > 0 && d > 0 && elem_sz > 0 && past_buf_seq >= 0;
+  const GqaDecodeCachePlan plan = build_gqa_decode_cache_plan(plan_input);
+  if (state) {
+    kv_cache_record_plan(state->kv_cache_counters, plan, past_len == 0);
+    state->kv_cache_capacity =
+        std::max<int64_t>(state->kv_cache_capacity, plan.capacity);
+  }
+  if (plan.decision == KvCacheDecision::Reject)
+    return record_kv_failure(state, stream, plan.reason, past_len, sq,
+                             present_seq);
+
+  if (plan.decision == KvCacheDecision::ConcatFallback) {
+    int rc = hip_gqa_kv_cache_concat(
+        stream, past_key, new_key, present_key, B, past_len, sq, G, d,
+        past_buf_seq, present_seq, elem_sz, kv_dtype, k_sc, copy_lo);
+    if (state)
+      kv_cache_record_concat_kernel(state->kv_cache_counters, rc == 0);
+    if (rc != 0)
+      return record_kv_failure(state, stream, KvCacheReason::KernelFailure,
+                               past_len, sq, present_seq);
+    rc = hip_gqa_kv_cache_concat(stream, past_value, new_value, present_value,
+                                 B, past_len, sq, G, d, past_buf_seq,
+                                 present_seq, elem_sz, kv_dtype, v_sc, copy_lo);
+    if (state)
+      kv_cache_record_concat_kernel(state->kv_cache_counters, rc == 0);
+    if (rc != 0)
+      return record_kv_failure(state, stream, KvCacheReason::KernelFailure,
+                               past_len, sq, present_seq);
   } else {
-    // In-place append: kernel can read past_len from device via seqlens_k_ptr.
-    if (hip_gqa_kv_cache_append(stream, new_key, present_key, B, sq, G, d,
-                                present_seq, past_len, seqlens_k_ptr, elem_sz,
-                                kv_dtype, k_sc) != 0)
-      return -1;
-    if (hip_gqa_kv_cache_append(stream, new_value, present_value, B, sq, G, d,
-                                present_seq, past_len, seqlens_k_ptr, elem_sz,
-                                kv_dtype, v_sc) != 0)
-      return -1;
+    int rc = hip_gqa_kv_cache_append(stream, new_key, present_key, B, sq, G, d,
+                                     present_seq, past_len, seqlens_k_ptr,
+                                     elem_sz, kv_dtype, k_sc);
+    if (state)
+      kv_cache_record_append_kernel(state->kv_cache_counters, rc == 0);
+    if (rc != 0)
+      return record_kv_failure(state, stream, KvCacheReason::KernelFailure,
+                               past_len, sq, present_seq);
+    rc = hip_gqa_kv_cache_append(stream, new_value, present_value, B, sq, G, d,
+                                 present_seq, past_len, seqlens_k_ptr, elem_sz,
+                                 kv_dtype, v_sc);
+    if (state)
+      kv_cache_record_append_kernel(state->kv_cache_counters, rc == 0);
+    if (rc != 0)
+      return record_kv_failure(state, stream, KvCacheReason::KernelFailure,
+                               past_len, sq, present_seq);
   }
   return 0;
 }
@@ -494,7 +542,7 @@ static int gqa_forward_fused(
     // instead in-place there is no prefix to copy and update_kv_cache appends.
     // So a bound here would be unreachable, and therefore untestable, code.
     if (update_kv_cache(
-            stream, past_key, past_value, kSrc, vSrc, present_key,
+            state, stream, past_key, past_value, kSrc, vSrc, present_key,
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
@@ -695,7 +743,7 @@ static int gqa_forward_fused(
     // Quantized cache: quantize-and-append/concat; fp16: plain. update_kv_cache
     // dispatches on kv_format internally.
     if (update_kv_cache(
-            stream, past_key, past_value, kSrc, vSrc, present_key,
+            state, stream, past_key, past_value, kSrc, vSrc, present_key,
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
@@ -1441,7 +1489,7 @@ static int gqa_forward_hipblaslt(
 
     // ---- Steps 4-5: KV cache update ----
     if (update_kv_cache(
-            stream, past_key, past_value, kSrc, vSrc, present_key,
+            state, stream, past_key, past_value, kSrc, vSrc, present_key,
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
@@ -2319,9 +2367,9 @@ static int gqa_forward_hipblaslt(
       // in-place (past_key == present_key) the prefix is already there and
       // update_kv_cache appends, ignoring this.
       HIP_CHECK(update_kv_cache(
-          stream, past_key, past_value, kSrc, vSrc, present_key, present_value,
-          static_cast<int>(B), static_cast<int>(past_len), static_cast<int>(sq),
-          static_cast<int>(G), static_cast<int>(d),
+          state, stream, past_key, past_value, kSrc, vSrc, present_key,
+          present_value, static_cast<int>(B), static_cast<int>(past_len),
+          static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
           static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
           (use_no_expand && !bidirectional_no_past) ? seqlens_k_ptr : nullptr,
           static_cast<int>(elem_sz), static_cast<int>(kv_lo),
@@ -2795,7 +2843,7 @@ static int gqa_forward_fused_from_fp32(
 
 //===----------------------------------------------------------------------===//
 // Public wrapper called by generated IR. ABI MUST stay identical to the
-// HipToLLVM lowering (kWrapGQA = "wrap_group_query_attention", 42 params).
+// HipToLLVM lowering (kWrapGQA = "wrap_group_query_attention", 43 params).
 //===----------------------------------------------------------------------===//
 int wrap_group_query_attention(
     RuntimeState *state, int op_state_slot,
@@ -2816,7 +2864,8 @@ int wrap_group_query_attention(
     // Shape values (6)
     int64_t batch_size, int64_t seq_len_q, int64_t seq_len_kv,
     int64_t past_buf_seq, int64_t head_dim, int64_t element_size_bytes,
-    int64_t attn_bias_batch, int64_t attn_bias_num_heads, int64_t kv_bnsd) {
+    int64_t attn_bias_batch, int64_t attn_bias_num_heads, int64_t kv_bnsd,
+    int64_t logical_total_seq) {
   OP_PROFILE(
       "gqa",
       [&] {
@@ -2884,6 +2933,19 @@ int wrap_group_query_attention(
   if (!stream) {
     fprintf(stderr, "wrap_group_query_attention: null stream\n");
     return -1;
+  }
+
+  if (logical_total_seq >= 0) {
+    if (batch_size != 1 || !seqlens_k || logical_total_seq < seq_len_q ||
+        logical_total_seq > seq_len_kv) {
+      return record_kv_failure(state, stream, KvCacheReason::InvalidLength,
+                               static_cast<int>(logical_total_seq - seq_len_q),
+                               static_cast<int>(seq_len_q),
+                               static_cast<int>(seq_len_kv));
+    }
+    state->seqlens_k_cached_valid = true;
+    state->seqlens_k_cached_val = static_cast<int32_t>(logical_total_seq - 1);
+    state->seqlens_k_cached_ptr = seqlens_k;
   }
 
   // ORT uses scale == 0.0 as sentinel for "auto-compute 1/sqrt(head_size)"

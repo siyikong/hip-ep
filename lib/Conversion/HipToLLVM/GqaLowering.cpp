@@ -201,6 +201,7 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
     // attention_bias broadcast extents: ONNX masks are often [B,1,S,T].
     Value attnBiasBatchVal = createI64Const(1);
     Value attnBiasNumHeadsVal = createI64Const(1);
+    Value logicalTotalSeqVal = createI64Const(-1);
     if (op.getAttentionBias()) {
       auto biasType = cast<MemRefType>(op.getAttentionBias().getType());
       if (biasType.getRank() == 4) {
@@ -208,11 +209,13 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
             biasType, 0, adaptor.getAttentionBias(), rewriter, loc);
         attnBiasNumHeadsVal = getMemRefDimSize(
             biasType, 1, adaptor.getAttentionBias(), rewriter, loc);
+        logicalTotalSeqVal = getMemRefDimSize(
+            biasType, 3, adaptor.getAttentionBias(), rewriter, loc);
       }
     }
 
     // Function signature matches wrap_group_query_attention() in gqa.cpp
-    SmallVector<Type, 42> paramTypes = {
+    SmallVector<Type, 43> paramTypes = {
         ptrType, // state
         i32Type, // op_state_slot
         // Inputs (14 pointers - some may be nullptr)
@@ -258,7 +261,8 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
         i64Type, // element_size_bytes
         i64Type, // attn_bias_batch
         i64Type, // attn_bias_num_heads
-        i64Type  // kv_bnsd
+        i64Type, // kv_bnsd
+        i64Type  // logical_total_seq (-1 => runtime D2H fallback)
     };
 
     FailureOr<LLVM::LLVMFuncOp> funcOp =
@@ -266,7 +270,7 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
     if (failed(funcOp))
       return failure();
 
-    SmallVector<Value, 42> args = {
+    SmallVector<Value, 43> args = {
         statePtr,
         // Per-instance op-state slot (threaded by --assign-op-state-slots)
         getOpStateSlotValue(op, rewriter, loc),
@@ -282,7 +286,8 @@ struct GqaOpLowering : public ConvertOpToLLVMPattern<GqaOp> {
         kvCacheBitWidth, noCausal,
         // Shape info (9 values)
         batchSizeVal, seqLenQVal, seqLenKVVal, pastBufSeqVal, headDimVal,
-        elemSizeVal, attnBiasBatchVal, attnBiasNumHeadsVal, kvBnsdVal};
+        elemSizeVal, attnBiasBatchVal, attnBiasNumHeadsVal, kvBnsdVal,
+        logicalTotalSeqVal};
 
     LLVM::CallOp::create(rewriter, loc, *funcOp, args);
 

@@ -232,6 +232,9 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->seqlens_k_cached_valid = false;
   state->seqlens_k_cached_val = 0;
   state->seqlens_k_cached_ptr = nullptr;
+  state->kv_cache_counters = {};
+  state->kv_cache_session_generation = 1;
+  state->kv_cache_capacity = 0;
   state->loop_iter_cpu_buf = nullptr;
   state->loop_iter_capacity = 0;
   state->loop_iter_dev = nullptr;
@@ -738,6 +741,21 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
   // Synchronize stream to ensure all GPU operations complete
   if (state->stream) {
     HIP_CLEANUP(hipStreamSynchronize(state->stream));
+  }
+
+  const auto &kv = state->kv_cache_counters;
+  if (hipdnn_ep_debug_enabled() &&
+      (kv.prefill_append_plans || kv.decode_append_plans || kv.concat_plans ||
+       kv.reject_plans || kv.kernel_failures)) {
+    char summary[1024];
+    const size_t required = kv_cache_summary_json(
+        kv, state->kv_cache_session_generation, /*arena_generation=*/0,
+        state->kv_cache_capacity, summary, sizeof(summary));
+    if (required > 0 && required < sizeof(summary))
+      fprintf(stderr, "[KV_CACHE_SUMMARY] %s\n", summary);
+    else
+      fprintf(stderr, "[KV_CACHE_ERROR] {\"schema\":1,\"reason\":"
+                      "\"summary_overflow\"}\n");
   }
 
   // Free shared workspace (if allocated)

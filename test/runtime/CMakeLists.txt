@@ -37,6 +37,19 @@ add_test(NAME OutputAllocatorUnitTest COMMAND test-output-allocator)
 
 set_target_properties(test-output-allocator PROPERTIES FOLDER "runtime-tests")
 
+add_executable(test-kv-cache-manager
+    test_kv_cache_manager.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Runtime/kv_cache_manager.cpp
+)
+
+target_compile_features(test-kv-cache-manager PRIVATE cxx_std_17)
+target_include_directories(test-kv-cache-manager PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Runtime
+)
+
+add_test(NAME KvCacheManagerUnitTest COMMAND test-kv-cache-manager)
+set_target_properties(test-kv-cache-manager PROPERTIES FOLDER "runtime-tests")
+
 # GQA offline autotune tests are GPU-free: they link the real embedded table
 # (lut/gfx1151.fb) and drive the same resolver that ships in
 # custom_kernels_<arch>, through the exported extern "C" shims. The resolver's

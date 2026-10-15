@@ -64,9 +64,8 @@ module {
         -> (tensor<1x1x2048xf16>, tensor<1x8x128x128xf16>,
             tensor<1x8x128x128xf16>)
 
-    // present KV seq = past_seq (127) + current_seq (1); seqlens_k = total - 1.
-    // CHECK: tensor.dim %{{.*}}, %c2
-    // CHECK: arith.addi
+    // Static output capacity is 128; logical total comes from mask dim 3.
+    // CHECK: tensor.dim %{{.*}}, %c3
     // CHECK: arith.subi
     // CHECK: tensor.from_elements %{{.*}} : tensor<1xi32>
     // CHECK: tensor.empty() : tensor<1x1x2048xf16>
@@ -117,14 +116,14 @@ module {
         -> (tensor<?x?x4096xf16>, tensor<?x8x?x256xf16>,
             tensor<?x8x?x256xf16>)
 
-    // present seq extent = past + current, materialised as arith.addi and fed
-    // into the present tensor.empty (dynamic seq dim), NOT dim(past_key, 2).
-    // CHECK: %[[CUR:.*]] = tensor.dim %{{.*}}, %c1
-    // CHECK: %[[PAST:.*]] = tensor.dim %{{.*}}, %c2
-    // CHECK: %[[TOT:.*]] = arith.addi %[[PAST]], %[[CUR]]
-    // CHECK: arith.subi %[[TOT]], %{{.*}}
+    // Logical total comes from the mask. Present storage uses max(past
+    // physical extent, logical total), separating capacity from valid length.
+    // CHECK-DAG: %[[PAST:.*]] = tensor.dim %{{.*}}, %c2
+    // CHECK-DAG: %[[LOGICAL:.*]] = tensor.dim %{{.*}}, %c3
+    // CHECK: %[[CAPACITY:.*]] = arith.maxsi %[[PAST]], %[[LOGICAL]]
+    // CHECK: arith.subi %[[LOGICAL]], %{{.*}}
     // CHECK: tensor.from_elements %{{.*}} : tensor<1xi32>
-    // CHECK: tensor.empty(%{{.*}}, %[[TOT]]) : tensor<?x8x?x256xf16>
+    // CHECK: tensor.empty(%{{.*}}, %[[CAPACITY]]) : tensor<?x8x?x256xf16>
     // CHECK: hip.gqa(%[[CTX2]])
     // CHECK-SAME: no_causal = true
     // CHECK-NOT: onnx.Attention
@@ -170,13 +169,13 @@ module {
         -> (tensor<?x?x2048xf16>, tensor<?x1x?x256xf16>,
             tensor<?x1x?x256xf16>)
 
-    // present seq extent = past + current; mask threaded as attention_bias (8
-    // hip.gqa ins: q, k, v, past_k, past_v, seqlens_k, total_seq, mask).
-    // CHECK: %[[CURG:.*]] = tensor.dim %{{.*}}, %c1
-    // CHECK: %[[PASTG:.*]] = tensor.dim %{{.*}}, %c2
-    // CHECK: %[[TOTG:.*]] = arith.addi %[[PASTG]], %[[CURG]]
+    // Logical total comes from the mask; capacity preserves a larger
+    // pre-bound past buffer when present.
+    // CHECK-DAG: %[[PASTG:.*]] = tensor.dim %{{.*}}, %c2
+    // CHECK-DAG: %[[LOGICALG:.*]] = tensor.dim %{{.*}}, %c3
+    // CHECK: %[[CAPACITYG:.*]] = arith.maxsi %[[PASTG]], %[[LOGICALG]]
     // CHECK: tensor.from_elements %{{.*}} : tensor<1xi32>
-    // CHECK: tensor.empty(%{{.*}}, %[[TOTG]]) : tensor<?x1x?x256xf16>
+    // CHECK: tensor.empty(%{{.*}}, %[[CAPACITYG]]) : tensor<?x1x?x256xf16>
     // CHECK: hip.gqa(%[[CTXG]])
     // Mask is threaded as the final hip.gqa input (attention_bias).
     // CHECK-SAME: ins({{.*}}tensor<?x1x?x?xf16>) outs
@@ -336,14 +335,12 @@ module {
            tensor<1x1x1x?xf16>)
         -> tensor<1x1x2048xf16>
 
-    // The synthesized present buffers are sized from K's seq extent (dynamic),
-    // NOT the query's static 1. past is the 0 constant (no past operand), so
-    // the total is 0 + dim(K, 1) and seqlens_k = total - 1.
-    // CHECK: %[[KVLEN:.*]] = tensor.dim %{{.*}}, %c1 : tensor<1x?x256xf16>
-    // CHECK: %[[TOT:.*]] = arith.addi %c0, %[[KVLEN]]
-    // CHECK: arith.subi %[[TOT]], %c1
+    // The synthesized present buffers use the mask's logical KV extent,
+    // which equals K's full-history extent for this sharing layer.
+    // CHECK: %[[LOGICAL6:.*]] = tensor.dim %{{.*}}, %c3
+    // CHECK: arith.subi %[[LOGICAL6]], %c1
     // CHECK: tensor.from_elements %{{.*}} : tensor<1xi32>
-    // CHECK: tensor.empty(%[[TOT]]) : tensor<1x1x?x256xf16>
+    // CHECK: tensor.empty(%[[LOGICAL6]]) : tensor<1x1x?x256xf16>
     // CHECK: hip.gqa(%[[CTX6]])
     // Mask is threaded as attention_bias; no past_key/past_value operands.
     // CHECK-SAME: ins({{.*}}tensor<1x1x1x?xf16>) outs

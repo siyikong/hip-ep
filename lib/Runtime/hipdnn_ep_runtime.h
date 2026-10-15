@@ -893,7 +893,9 @@ int wrap_group_query_attention(
     // path, where key/value are the full Skv-length KV and must be staged into
     // the BNSD present cache: BSHD and BNSD coincide only at G == 1, so the
     // layout cannot be inferred from the shapes.
-    int64_t kv_bnsd);
+    int64_t kv_bnsd,
+    // Host-visible logical KV total; -1 retains device seqlens_k readback.
+    int64_t logical_total_seq);
 
 // MultiHeadAttention operation wrapper (com.microsoft.MultiHeadAttention v1).
 // Called by generated IR for onnx.Custom(MultiHeadAttention) lowering.

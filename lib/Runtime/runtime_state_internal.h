@@ -17,6 +17,7 @@
 #ifndef HIPDNN_EP_RUNTIME_STATE_INTERNAL_H
 #define HIPDNN_EP_RUNTIME_STATE_INTERNAL_H
 
+#include "kv_cache_manager.h"
 #include "runtime_types.h"
 // For hipdnn_output_allocator_t (the output_allocator field below). Acyclic:
 // hipdnn_ep_runtime.h only forward-declares RuntimeState; it does not include
@@ -257,6 +258,12 @@ struct RuntimeState {
   bool seqlens_k_cached_valid;
   int32_t seqlens_k_cached_val;
   const void *seqlens_k_cached_ptr;
+
+  // Session-level KV path observability. OGA owns the arena; runtime only
+  // classifies launches and counts actual K/V kernels.
+  KvCacheCounters kv_cache_counters;
+  uint64_t kv_cache_session_generation;
+  int64_t kv_cache_capacity;
 
   // ONNX Loop driver state. Lazily allocated by hipdnn_ep_run_counted_loop /
   // hipdnn_ep_run_loop on first call; freed in hipdnn_ep_state_cleanup.
